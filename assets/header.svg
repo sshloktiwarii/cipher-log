@@ -1,5 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 280" width="100%" height="280" style="background: transparent;">
   <defs>
+    <!-- Container Clipping Boundary -->
+    <clipPath id="containerClip">
+      <rect x="8" y="8" width="904" height="264" rx="8" />
+    </clipPath>
+
     <!-- Dark Tech Gradients -->
     <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#07090E" />
@@ -62,14 +67,9 @@
       50% { opacity: 0; }
     }
 
-    @keyframes pulseTag {
-      0%, 100% { opacity: 0.85; }
-      50% { opacity: 0.4; }
-    }
-
     .ascii-text {
       font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
-      font-size: 11px;
+      font-size: 10.5px;
       line-height: 12px;
       font-weight: 700;
       fill: #C084FC;
@@ -159,7 +159,7 @@
   <!-- Bottom Telemetry HUD Bar -->
   <g transform="translate(24, 248)">
     <line x1="0" y1="-14" x2="872" y2="-14" stroke="#1E293B" stroke-width="1" />
-    <text x="0" y="2" class="hud-subtitle">▶ TAMPER-PROOF MERKLE LEDGER & AUDIT TRAIL</text>
+    <text x="0" y="2" class="hud-subtitle">▶ TAMPER-PROOF MERKLE LEDGER &amp; AUDIT TRAIL</text>
     <rect class="cursor" x="338.8" y="-9" width="7" height="13" />
     <text x="730" y="2" class="hud-title" text-anchor="start">SYS_STATE: ONLINE</text>
   </g>
