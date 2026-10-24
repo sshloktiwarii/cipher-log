@@ -1,0 +1,5 @@
+telemetry-engine
+*.exe
+*.test
+.DS_Store
+.env

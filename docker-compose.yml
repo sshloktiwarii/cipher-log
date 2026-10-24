@@ -1,0 +1,51 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: timescaledb-telemetry
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: telemetry
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./scripts/init_timescaledb.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d telemetry"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  telemetry-engine:
+    build: .
+    container_name: telemetry-engine
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      PORT: "8082"
+      DATABASE_URL: "postgres://postgres:password@timescaledb:5432/telemetry?sslmode=disable"
+      BUFFER_SIZE: "10000"
+      BATCH_SIZE: "100"
+      WORKER_COUNT: "8"
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana-telemetry
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  timescale_data:
+  grafana_data:
