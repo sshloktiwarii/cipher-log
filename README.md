@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/header.svg" width="100%" alt="Cipher Header Banner" />
+  <img src="assets/header.svg?v=2" width="100%" alt="Cipher Header Banner" />
 </p>
 
 # cipher-log

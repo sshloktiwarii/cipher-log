@@ -159,8 +159,8 @@
   <!-- Bottom Telemetry HUD Bar -->
   <g transform="translate(24, 248)">
     <line x1="0" y1="-14" x2="872" y2="-14" stroke="#1E293B" stroke-width="1" />
-    <text x="0" y="2" class="hud-subtitle">▶ TAMPER-PROOF MERKLE LEDGER &amp; AUDIT TRAIL</text>
-    <rect class="cursor" x="338.8" y="-9" width="7" height="13" />
+    <text x="0" y="2" class="hud-subtitle">▶ TAMPER-PROOF MERKLE LEDGER // SHA-256 AUDIT TRAIL</text>
+    <rect class="cursor" x="398.0" y="-9" width="7" height="13" />
     <text x="730" y="2" class="hud-title" text-anchor="start">SYS_STATE: ONLINE</text>
   </g>
 
