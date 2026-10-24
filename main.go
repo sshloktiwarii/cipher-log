@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "modernc.org/sqlite"
 )
 
 type TelemetryEvent struct {
@@ -37,11 +40,14 @@ type Config struct {
 	FlushTimeout time.Duration
 	WorkerCount  int
 	AnomalyCheck time.Duration
+	LowMem       bool
+	SQLitePath   string
 }
 
 type IngestionEngine struct {
 	cfg            Config
 	pool           *pgxpool.Pool
+	sqliteDB       *sql.DB
 	eventChan      chan TelemetryEvent
 	wg             sync.WaitGroup
 	ctx            context.Context
@@ -63,7 +69,36 @@ func NewIngestionEngine(cfg Config) *IngestionEngine {
 		memBackup: make([]TelemetryEvent, 0, 1000),
 	}
 
-	if cfg.DatabaseURL != "" {
+	if cfg.LowMem {
+		log.Printf("[INIT] Low-Memory Mode Enabled: Initializing embedded SQLite at %s", cfg.SQLitePath)
+		db, err := sql.Open("sqlite", cfg.SQLitePath)
+		if err == nil {
+			if _, pragmaErr := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;`); pragmaErr != nil {
+				log.Printf("[WARN] Failed to set SQLite WAL PRAGMAs: %v", pragmaErr)
+			}
+			schema := `
+			CREATE TABLE IF NOT EXISTS telemetry_events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+				source TEXT,
+				event_type TEXT,
+				metrics TEXT,
+				metadata TEXT
+			);
+			CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_events(timestamp);
+			CREATE INDEX IF NOT EXISTS idx_telemetry_source ON telemetry_events(source);
+			`
+			if _, schemaErr := db.Exec(schema); schemaErr == nil {
+				log.Println("[INFO] Successfully initialized SQLite WAL telemetry database")
+				engine.sqliteDB = db
+				engine.dbAvailable = true
+			} else {
+				log.Printf("[ERROR] Failed to create SQLite schema: %v", schemaErr)
+			}
+		} else {
+			log.Printf("[ERROR] Failed to open SQLite database: %v", err)
+		}
+	} else if cfg.DatabaseURL != "" {
 		poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 		if err == nil {
 			poolCfg.MaxConns = 25
@@ -91,7 +126,7 @@ func NewIngestionEngine(cfg Config) *IngestionEngine {
 		go engine.worker(i)
 	}
 
-	// Start anomaly detection background monitor (every 60s)
+	// Start anomaly detection background monitor
 	engine.wg.Add(1)
 	go engine.anomalyMonitor()
 
@@ -145,7 +180,34 @@ func (e *IngestionEngine) flushBatch(batch []TelemetryEvent) {
 		return
 	}
 
-	if e.dbAvailable && e.pool != nil {
+	// 1. Low-Memory SQLite Ingestion Route
+	if e.cfg.LowMem && e.sqliteDB != nil {
+		tx, err := e.sqliteDB.Begin()
+		if err == nil {
+			stmt, prepErr := tx.Prepare(`INSERT INTO telemetry_events (timestamp, source, event_type, metrics, metadata) VALUES (?, ?, ?, ?, ?)`)
+			if prepErr == nil {
+				allOk := true
+				for _, ev := range batch {
+					metricsJSON, _ := json.Marshal(ev.Metrics)
+					metaJSON, _ := json.Marshal(ev.Metadata)
+					tsStr := ev.parsedTime.Format("2006-01-02 15:04:05.000")
+					if _, execErr := stmt.Exec(tsStr, ev.Source, ev.EventType, string(metricsJSON), string(metaJSON)); execErr != nil {
+						allOk = false
+						break
+					}
+				}
+				_ = stmt.Close()
+				if allOk && tx.Commit() == nil {
+					atomic.AddUint64(&e.totalPersisted, uint64(len(batch)))
+					return
+				}
+			}
+			_ = tx.Rollback()
+		}
+	}
+
+	// 2. High-Throughput TimescaleDB Route
+	if !e.cfg.LowMem && e.dbAvailable && e.pool != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
@@ -169,6 +231,7 @@ func (e *IngestionEngine) flushBatch(batch []TelemetryEvent) {
 		}
 	}
 
+	// 3. Fallback: In-Memory Ring Buffer
 	e.memLock.Lock()
 	if len(e.memBackup)+len(batch) > 10000 {
 		excess := (len(e.memBackup) + len(batch)) - 10000
@@ -180,10 +243,8 @@ func (e *IngestionEngine) flushBatch(batch []TelemetryEvent) {
 	}
 	e.memBackup = append(e.memBackup, batch...)
 	e.memLock.Unlock()
-	atomic.AddUint64(&e.totalPersisted, uint64(len(batch)))
 }
 
-// anomalyMonitor checks TimescaleDB every 60s for error rate > 5% or latency spikes
 func (e *IngestionEngine) anomalyMonitor() {
 	defer e.wg.Done()
 	ticker := time.NewTicker(e.cfg.AnomalyCheck)
@@ -194,98 +255,83 @@ func (e *IngestionEngine) anomalyMonitor() {
 		case <-e.ctx.Done():
 			return
 		case <-ticker.C:
-			e.checkAnomalies()
-		}
-	}
-}
-
-func (e *IngestionEngine) checkAnomalies() {
-	if e.pool == nil || !e.dbAvailable {
-		// Evaluate in-memory sliding window
-		e.memLock.RLock()
-		defer e.memLock.RUnlock()
-		if len(e.memBackup) == 0 {
-			return
-		}
-
-		errorsCount := 0
-		for _, ev := range e.memBackup {
-			if st, exists := ev.Metadata["status"]; exists && (st == "error" || st == "timeout" || strings.HasPrefix(st, "5")) {
-				errorsCount++
+			// Inspect recent error rates
+			e.memLock.RLock()
+			errCount := 0
+			sampleWindow := len(e.memBackup)
+			for _, ev := range e.memBackup {
+				if strings.Contains(strings.ToLower(ev.EventType), "error") ||
+					strings.Contains(strings.ToLower(ev.EventType), "timeout") {
+					errCount++
+				}
 			}
-		}
+			e.memLock.RUnlock()
 
-		errorRate := (float64(errorsCount) / float64(len(e.memBackup))) * 100.0
-		if errorRate > 5.0 {
-			log.Printf("🚨 [ANOMALY ALERT] Error rate spike detected: %.2f%% (threshold: 5.0%%) across %d events",
-				errorRate, len(e.memBackup))
-		}
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Query last 5 minutes from TimescaleDB
-	query := `
-		SELECT 
-			count(*) AS total,
-			count(*) FILTER (WHERE metadata->>'status' IN ('error', 'timeout') OR (metrics->>'http_status')::int >= 500) AS errors,
-			coalesce(percentile_cont(0.99) WITHIN GROUP (ORDER BY (metrics->>'latency_ms')::numeric), 0) AS p99_latency
-		FROM telemetry_events 
-		WHERE time > NOW() - INTERVAL '5 minutes';
-	`
-
-	var total, errorsCount int64
-	var p99Latency float64
-
-	err := e.pool.QueryRow(ctx, query).Scan(&total, &errorsCount, &p99Latency)
-	if err == nil && total > 0 {
-		errorRate := (float64(errorsCount) / float64(total)) * 100.0
-		if errorRate > 5.0 {
-			log.Printf("🚨 [ANOMALY ALERT] High error rate: %.2f%% (%d/%d failed) in last 5m!", errorRate, errorsCount, total)
-		}
-		if p99Latency > 2000.0 {
-			log.Printf("🚨 [ANOMALY ALERT] Latency spike! P99 latency is %.2f ms (threshold: 2000ms)", p99Latency)
+			if sampleWindow > 50 && float64(errCount)/float64(sampleWindow) > 0.3 {
+				log.Printf("[ALERT] High anomaly error rate detected in recent window: %d errors / %d events", errCount, sampleWindow)
+			}
 		}
 	}
 }
 
 func (e *IngestionEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if r.URL.Path == "/healthz" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"healthy","database_connected":%t,"ingested_count":%d,"persisted_count":%d,"anomaly_monitor":true}`,
-			e.dbAvailable, atomic.LoadUint64(&e.totalIngested), atomic.LoadUint64(&e.totalPersisted))))
-		return
-	}
-
-	if r.URL.Path == "/ingest" {
-		if r.Method != http.MethodPost {
-			http.Error(w, `{"error":"Method not allowed, use POST"}`, http.StatusMethodNotAllowed)
-			return
-		}
+	switch {
+	case r.URL.Path == "/healthz" && r.Method == http.MethodGet:
+		e.handleHealth(w, r)
+	case r.URL.Path == "/health" && r.Method == http.MethodGet:
+		e.handleHealth(w, r)
+	case r.URL.Path == "/ingest" && r.Method == http.MethodPost:
 		e.handleIngest(w, r)
-		return
+	case r.URL.Path == "/metrics/summary" && r.Method == http.MethodGet:
+		e.handleSummary(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (e *IngestionEngine) handleHealth(w http.ResponseWriter, r *http.Request) {
+	storageType := "timescaledb"
+	if e.cfg.LowMem {
+		storageType = "sqlite-embedded-wal"
 	}
 
-	http.NotFound(w, r)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service":         "cipher-log",
+		"status":          "healthy",
+		"low_mem":         e.cfg.LowMem,
+		"storage":         storageType,
+		"db_available":    e.dbAvailable,
+		"queue_depth":     len(e.eventChan),
+		"total_ingested":  atomic.LoadUint64(&e.totalIngested),
+		"total_persisted": atomic.LoadUint64(&e.totalPersisted),
+	})
+}
+
+func (e *IngestionEngine) handleSummary(w http.ResponseWriter, r *http.Request) {
+	e.memLock.RLock()
+	backupCount := len(e.memBackup)
+	e.memLock.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"total_ingested":  atomic.LoadUint64(&e.totalIngested),
+		"total_persisted": atomic.LoadUint64(&e.totalPersisted),
+		"buffered_backup": backupCount,
+		"low_mem_mode":    e.cfg.LowMem,
+		"storage_backend": func() string {
+			if e.cfg.LowMem {
+				return "sqlite3-wal"
+			}
+			return "timescaledb"
+		}(),
+	})
 }
 
 func (e *IngestionEngine) handleIngest(w http.ResponseWriter, r *http.Request) {
-	// Guard against unbounded body DoS
-	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1024*1024))
 	if err != nil {
-		http.Error(w, `{"error":"Failed to read body"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"Request body too large"}`, http.StatusRequestEntityTooLarge)
 		return
 	}
 	_ = r.Body.Close()
@@ -297,7 +343,7 @@ func (e *IngestionEngine) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if event.Source == "" || event.EventType == "" || event.Metrics == nil {
-		http.Error(w, `{"error":"Missing required fields"}`, http.StatusUnprocessableEntity)
+		http.Error(w, `{"error":"Missing required fields: source, event_type, metrics"}`, http.StatusUnprocessableEntity)
 		return
 	}
 
@@ -330,6 +376,9 @@ func (e *IngestionEngine) Close() {
 	if e.pool != nil {
 		e.pool.Close()
 	}
+	if e.sqliteDB != nil {
+		_ = e.sqliteDB.Close()
+	}
 }
 
 func getEnv(key, defaultVal string) string {
@@ -340,7 +389,18 @@ func getEnv(key, defaultVal string) string {
 }
 
 func main() {
+	lowMemFlag := flag.Bool("low-mem", false, "Enable low-memory embedded SQLite WAL ingestion mode")
+	sqlitePathFlag := flag.String("sqlite-path", "./telemetry.db", "File path for local SQLite database in low-mem mode")
+	portFlag := flag.String("port", "", "HTTP port to bind (overrides PORT env)")
+	flag.Parse()
+
 	port := getEnv("PORT", "8082")
+	if *portFlag != "" {
+		port = *portFlag
+	}
+
+	isLowMem := *lowMemFlag || strings.ToLower(os.Getenv("LOW_MEM")) == "true"
+	sqlitePath := getEnv("SQLITE_PATH", *sqlitePathFlag)
 	dbURL := getEnv("DATABASE_URL", "postgres://postgres:password@localhost:5432/telemetry?sslmode=disable")
 	bufSize, _ := strconv.Atoi(getEnv("BUFFER_SIZE", "10000"))
 	batchSize, _ := strconv.Atoi(getEnv("BATCH_SIZE", "100"))
@@ -355,6 +415,8 @@ func main() {
 		FlushTimeout: time.Duration(flushMs) * time.Millisecond,
 		WorkerCount:  workers,
 		AnomalyCheck: 60 * time.Second,
+		LowMem:       isLowMem,
+		SQLitePath:   sqlitePath,
 	}
 
 	engine := NewIngestionEngine(cfg)
@@ -370,8 +432,11 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[INIT] Local Telemetry & Anomaly Engine running on :%s", cfg.Port)
-		log.Printf("[INIT] Anomaly Detection: Continuous aggregate check active every 60s")
+		modeStr := "TimescaleDB Cluster"
+		if cfg.LowMem {
+			modeStr = fmt.Sprintf("Embedded SQLite WAL (%s)", cfg.SQLitePath)
+		}
+		log.Printf("[INIT] Cipher-Log Telemetry Engine running on :%s [Storage: %s]", cfg.Port, modeStr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("[FATAL] Server error: %v", err)
 		}
