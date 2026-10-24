@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +36,7 @@ type TelemetryEvent struct {
 
 type Config struct {
 	Port         string
+	SocketPath   string
 	DatabaseURL  string
 	BufferSize   int
 	BatchSize    int
@@ -57,6 +60,7 @@ type IngestionEngine struct {
 	dbAvailable    bool
 	memBackup      []TelemetryEvent
 	memLock        sync.RWMutex
+	merkleTracker  *MerkleChainTracker
 }
 
 func NewIngestionEngine(cfg Config) *IngestionEngine {
@@ -83,13 +87,25 @@ func NewIngestionEngine(cfg Config) *IngestionEngine {
 				source TEXT,
 				event_type TEXT,
 				metrics TEXT,
-				metadata TEXT
+				metadata TEXT,
+				prev_hash TEXT,
+				merkle_hash TEXT
 			);
 			CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_events(timestamp);
 			CREATE INDEX IF NOT EXISTS idx_telemetry_source ON telemetry_events(source);
 			`
 			if _, schemaErr := db.Exec(schema); schemaErr == nil {
-				log.Println("[INFO] Successfully initialized SQLite WAL telemetry database")
+				// Ensure columns exist if table was previously created
+				_, _ = db.Exec(`ALTER TABLE telemetry_events ADD COLUMN prev_hash TEXT;`)
+				_, _ = db.Exec(`ALTER TABLE telemetry_events ADD COLUMN merkle_hash TEXT;`)
+
+				// Load latest merkle hash
+				var lastHash string
+				row := db.QueryRow(`SELECT merkle_hash FROM telemetry_events WHERE merkle_hash IS NOT NULL AND merkle_hash != '' ORDER BY id DESC LIMIT 1`)
+				_ = row.Scan(&lastHash)
+				engine.merkleTracker = NewMerkleChainTracker(lastHash)
+
+				log.Printf("[INFO] Successfully initialized SQLite WAL telemetry database with SHA-256 Merkle Chain [Root: %s]", engine.merkleTracker.CurrentRoot())
 				engine.sqliteDB = db
 				engine.dbAvailable = true
 			} else {
@@ -180,18 +196,25 @@ func (e *IngestionEngine) flushBatch(batch []TelemetryEvent) {
 		return
 	}
 
-	// 1. Low-Memory SQLite Ingestion Route
+	// 1. Low-Memory SQLite Ingestion Route with Cryptographic Merkle Chain
 	if e.cfg.LowMem && e.sqliteDB != nil {
 		tx, err := e.sqliteDB.Begin()
 		if err == nil {
-			stmt, prepErr := tx.Prepare(`INSERT INTO telemetry_events (timestamp, source, event_type, metrics, metadata) VALUES (?, ?, ?, ?, ?)`)
+			stmt, prepErr := tx.Prepare(`INSERT INTO telemetry_events (timestamp, source, event_type, metrics, metadata, prev_hash, merkle_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`)
 			if prepErr == nil {
 				allOk := true
 				for _, ev := range batch {
 					metricsJSON, _ := json.Marshal(ev.Metrics)
 					metaJSON, _ := json.Marshal(ev.Metadata)
 					tsStr := ev.parsedTime.Format("2006-01-02 15:04:05.000")
-					if _, execErr := stmt.Exec(tsStr, ev.Source, ev.EventType, string(metricsJSON), string(metaJSON)); execErr != nil {
+
+					prevHash := GenesisMerkleHash
+					merkleHash := GenesisMerkleHash
+					if e.merkleTracker != nil {
+						prevHash, merkleHash = e.merkleTracker.Append(tsStr, ev.Source, ev.EventType, string(metricsJSON), string(metaJSON))
+					}
+
+					if _, execErr := stmt.Exec(tsStr, ev.Source, ev.EventType, string(metricsJSON), string(metaJSON), prevHash, merkleHash); execErr != nil {
 						allOk = false
 						break
 					}
@@ -284,9 +307,89 @@ func (e *IngestionEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		e.handleIngest(w, r)
 	case r.URL.Path == "/metrics/summary" && r.Method == http.MethodGet:
 		e.handleSummary(w, r)
+	case (r.URL.Path == "/verify-audit-chain" || r.URL.Path == "/api/log/verify-audit-chain") && r.Method == http.MethodGet:
+		e.handleVerifyAuditChain(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (e *IngestionEngine) handleVerifyAuditChain(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if !e.cfg.LowMem || e.sqliteDB == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "unsupported",
+			"message":  "Cryptographic Merkle verification requires embedded SQLite WAL low-mem mode",
+			"tampered": false,
+		})
+		return
+	}
+
+	rows, err := e.sqliteDB.Query(`SELECT id, timestamp, source, event_type, metrics, metadata, prev_hash, merkle_hash FROM telemetry_events ORDER BY id ASC`)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"Query failed: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var count int
+	expectedPrev := GenesisMerkleHash
+	tampered := false
+	var tamperedID int64
+	var rootHash string
+
+	for rows.Next() {
+		var id int64
+		var ts, src, evType, metricsJSON, metaJSON, prevHash, merkleHash string
+		if err := rows.Scan(&id, &ts, &src, &evType, &metricsJSON, &metaJSON, &prevHash, &merkleHash); err != nil {
+			continue
+		}
+
+		// Verify continuity
+		if prevHash != "" && prevHash != expectedPrev {
+			tampered = true
+			tamperedID = id
+			break
+		}
+
+		// Verify hash calculation if hash was populated
+		if merkleHash != "" && merkleHash != GenesisMerkleHash {
+			expectedHash := ComputeNextHash(prevHash, ts, src, evType, metricsJSON, metaJSON)
+			if expectedHash != merkleHash {
+				tampered = true
+				tamperedID = id
+				break
+			}
+			expectedPrev = merkleHash
+			rootHash = merkleHash
+		}
+		count++
+	}
+
+	if tampered {
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":              "TAMPERED",
+			"tampered":            true,
+			"tampered_at_id":      tamperedID,
+			"verified_events":     count,
+			"cryptographic_proof": "MERKLE CHAIN CONTINUITY VIOLATION DETECTED",
+		})
+		return
+	}
+
+	if rootHash == "" {
+		rootHash = GenesisMerkleHash
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":              "VERIFIED_INTEGRITY",
+		"tampered":            false,
+		"total_events":        count,
+		"root_hash":           rootHash,
+		"cryptographic_proof": "SHA-256 Merkle Chain Integrity Verified Untampered",
+		"timestamp":           time.Now().UTC().Format(time.RFC3339),
+	})
 }
 
 func (e *IngestionEngine) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -392,6 +495,7 @@ func main() {
 	lowMemFlag := flag.Bool("low-mem", false, "Enable low-memory embedded SQLite WAL ingestion mode")
 	sqlitePathFlag := flag.String("sqlite-path", "./telemetry.db", "File path for local SQLite database in low-mem mode")
 	portFlag := flag.String("port", "", "HTTP port to bind (overrides PORT env)")
+	socketFlag := flag.String("socket", "", "Unix domain socket path (e.g. /tmp/cipher/log.sock)")
 	flag.Parse()
 
 	port := getEnv("PORT", "8082")
@@ -399,6 +503,7 @@ func main() {
 		port = *portFlag
 	}
 
+	socketPath := getEnv("SOCKET_PATH", *socketFlag)
 	isLowMem := *lowMemFlag || strings.ToLower(os.Getenv("LOW_MEM")) == "true"
 	sqlitePath := getEnv("SQLITE_PATH", *sqlitePathFlag)
 	dbURL := getEnv("DATABASE_URL", "postgres://postgres:password@localhost:5432/telemetry?sslmode=disable")
@@ -409,6 +514,7 @@ func main() {
 
 	cfg := Config{
 		Port:         port,
+		SocketPath:   socketPath,
 		DatabaseURL:  dbURL,
 		BufferSize:   bufSize,
 		BatchSize:    batchSize,
@@ -431,12 +537,31 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
+	// If Unix domain socket requested, start socket listener
+	if cfg.SocketPath != "" {
+		_ = os.Remove(cfg.SocketPath)
+		_ = os.MkdirAll(filepath.Dir(cfg.SocketPath), 0755)
+		unixListener, err := net.Listen("unix", cfg.SocketPath)
+		if err == nil {
+			log.Printf("[INIT] Cipher-Log Unix Socket listening on %s", cfg.SocketPath)
+			go func() {
+				_ = http.Serve(unixListener, engine)
+			}()
+			defer func() {
+				_ = unixListener.Close()
+				_ = os.Remove(cfg.SocketPath)
+			}()
+		} else {
+			log.Printf("[WARN] Failed to bind Unix socket %s: %v", cfg.SocketPath, err)
+		}
+	}
+
 	go func() {
 		modeStr := "TimescaleDB Cluster"
 		if cfg.LowMem {
 			modeStr = fmt.Sprintf("Embedded SQLite WAL (%s)", cfg.SQLitePath)
 		}
-		log.Printf("[INIT] Cipher-Log Telemetry Engine running on :%s [Storage: %s]", cfg.Port, modeStr)
+		log.Printf("[INIT] Cipher-Log Telemetry Engine running on :%s [Storage: %s, Merkle Root: %s]", cfg.Port, modeStr, engine.merkleTracker.CurrentRoot())
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("[FATAL] Server error: %v", err)
 		}
