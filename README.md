@@ -4,6 +4,8 @@ High-throughput telemetry ingestion engine and cryptographic Merkle audit ledger
 
 Written in pure Go. Buffers and flushes unstructured telemetry streams into an embedded SQLite WAL database and chains every event into an append-only SHA-256 Merkle tree for zero-trust integrity verification.
 
+Looking for a plain-English, non-technical summary? See [EXPLAINER.md](EXPLAINER.md).
+
 ---
 
 ## Technical Specifications
