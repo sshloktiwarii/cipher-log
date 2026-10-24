@@ -1,0 +1,174 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 280" width="100%" height="280" style="background: transparent;">
+  <defs>
+    <!-- Dark Tech Gradients -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#07090E" />
+      <stop offset="50%" stop-color="#0B0F17" />
+      <stop offset="100%" stop-color="#06080C" />
+    </linearGradient>
+
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#C084FC" stop-opacity="0.8" />
+      <stop offset="35%" stop-color="#3B82F6" stop-opacity="0.3" />
+      <stop offset="70%" stop-color="#C084FC" stop-opacity="0.7" />
+      <stop offset="100%" stop-color="#1E293B" stop-opacity="0.4" />
+    </linearGradient>
+
+    <linearGradient id="glowGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#C084FC" stop-opacity="0.3" />
+      <stop offset="100%" stop-color="#C084FC" stop-opacity="0" />
+    </linearGradient>
+
+    <!-- Scanline Pattern -->
+    <pattern id="scanlines" width="100" height="4" patternUnits="userSpaceOnUse">
+      <line x1="0" y1="0" x2="100" y2="0" stroke="#000000" stroke-width="1.2" opacity="0.35" />
+    </pattern>
+
+    <!-- Matrix Glow Filter -->
+    <filter id="matrixGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <filter id="softGlow">
+      <feGaussianBlur stdDeviation="1.5" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <style>
+    @keyframes matrixDecode {
+      0% { opacity: 0; clip-path: inset(0 100% 0 0); filter: blur(4px); }
+      30% { opacity: 0.8; filter: blur(2px); }
+      60% { clip-path: inset(0 0 0 0); filter: blur(0px); opacity: 1; }
+      100% { opacity: 1; }
+    }
+
+    @keyframes beamSweep {
+      0% { transform: translateX(-920px); opacity: 0; }
+      20% { opacity: 0.7; }
+      60% { opacity: 0.7; }
+      100% { transform: translateX(920px); opacity: 0; }
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+
+    @keyframes pulseTag {
+      0%, 100% { opacity: 0.85; }
+      50% { opacity: 0.4; }
+    }
+
+    .ascii-text {
+      font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+      font-size: 11px;
+      line-height: 12px;
+      font-weight: 700;
+      fill: #C084FC;
+      white-space: pre;
+      filter: drop-shadow(0 0 6px #C084FC88);
+      animation: matrixDecode 1.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+
+    .hud-title {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'JetBrains Mono', sans-serif;
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 2px;
+      fill: #94A3B8;
+      text-transform: uppercase;
+    }
+
+    .hud-subtitle {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 1.5px;
+      fill: #C084FC;
+    }
+
+    .hud-badge {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 9.5px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      fill: #F8FAFC;
+    }
+
+    .cursor {
+      animation: blink 0.9s infinite;
+      fill: #C084FC;
+    }
+
+    .beam {
+      animation: beamSweep 6s infinite ease-in-out;
+    }
+  </style>
+
+  <!-- Container Box -->
+  <rect x="8" y="8" width="904" height="264" rx="8" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="1.2" />
+
+  <!-- Grid Tech Backing -->
+  <g opacity="0.08" stroke="#FFFFFF" stroke-width="0.5">
+    <line x1="8" y1="44" x2="912" y2="44" />
+    <line x1="8" y1="236" x2="912" y2="236" />
+    <line x1="300" y1="8" x2="300" y2="272" />
+    <line x1="620" y1="8" x2="620" y2="272" />
+  </g>
+
+  <!-- Laser Scanline Sweeper -->
+  <g clip-path="url(#containerClip)">
+    <rect class="beam" x="8" y="8" width="120" height="264" fill="url(#glowGrad)" />
+  </g>
+
+  <!-- Scanline CRT Texture Overlay -->
+  <rect x="8" y="8" width="904" height="264" rx="8" fill="url(#scanlines)" pointer-events="none" />
+
+  <!-- Top HUD Bar -->
+  <g transform="translate(24, 28)">
+    <!-- Node status indicator -->
+    <circle cx="4" cy="4" r="3.5" fill="#C084FC" filter="url(#softGlow)" />
+    <text x="16" y="7" class="hud-title">SYSTEM PROTOCOL // SHA-256 INTEGRITY</text>
+    
+    <!-- Right Badge -->
+    <g transform="translate(730, -6)">
+      <rect x="0" y="0" width="134" height="20" rx="4" fill="#0F172A" stroke="#C084FC" stroke-width="0.8" opacity="0.9" />
+      <circle cx="10" cy="10" r="2.5" fill="#C084FC" />
+      <text x="22" y="13.5" class="hud-badge">PORT 8082</text>
+    </g>
+  </g>
+
+  <!-- ASCII Art Body -->
+  <g transform="translate(26, 60)">
+    <text class="ascii-text"><tspan x="0" y="12">  ██████╗██╗██████╗ ██╗  ██╗███████╗██████╗       ██╗      ██████╗  ██████╗ </tspan>
+    <tspan x="0" y="28"> ██╔════╝██║██╔══██╗██║  ██║██╔════╝██╔══██╗      ██║     ██╔═══██╗██╔════╝ </tspan>
+    <tspan x="0" y="44"> ██║     ██║██████╔╝███████║█████╗  ██████╔╝█████╗██║     ██║   ██║██║  ███╗</tspan>
+    <tspan x="0" y="60"> ██║     ██║██╔═══╝ ██╔══██║██╔══╝  ██╔══██╗╚════╝██║     ██║   ██║██║   ██║</tspan>
+    <tspan x="0" y="76"> ╚██████╗██║██║     ██║  ██║███████╗██║  ██║      ███████╗╚██████╔╝╚██████╔╝</tspan>
+    <tspan x="0" y="92">  ╚═════╝╚═╝╚═╝     ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝      ╚══════╝ ╚═════╝  ╚═════╝ </tspan></text>
+  </g>
+
+  <!-- Bottom Telemetry HUD Bar -->
+  <g transform="translate(24, 248)">
+    <line x1="0" y1="-14" x2="872" y2="-14" stroke="#1E293B" stroke-width="1" />
+    <text x="0" y="2" class="hud-subtitle">▶ TAMPER-PROOF MERKLE LEDGER & AUDIT TRAIL</text>
+    <rect class="cursor" x="338.8" y="-9" width="7" height="13" />
+    <text x="730" y="2" class="hud-title" text-anchor="start">SYS_STATE: ONLINE</text>
+  </g>
+
+  <!-- Technical Corner Brackets -->
+  <g stroke="#C084FC" stroke-width="1.5" fill="none" opacity="0.65">
+    <path d="M 12 24 L 12 12 L 24 12" />
+    <path d="M 900 12 L 912 12 L 912 24" />
+    <path d="M 12 256 L 12 268 L 24 268" />
+    <path d="M 900 268 L 912 268 L 912 256" />
+  </g>
+</svg>

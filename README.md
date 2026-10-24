@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/header.svg" width="100%" alt="Cipher Header Banner" />
+</p>
+
 # cipher-log
 
 High-throughput telemetry ingestion engine and cryptographic Merkle audit ledger.
