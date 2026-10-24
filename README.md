@@ -1,6 +1,6 @@
-# Foundry Pulse: High-Throughput Telemetry & Anomaly Ingestion Engine
+# cipher-log: High-Throughput Telemetry & Anomaly Ingestion Engine
 
-High-throughput observability API gateway built in Go with TimescaleDB that ingests unstructured time-series metrics from upstream services (`foundry-router` and `foundry-crucible`).
+High-throughput observability API gateway built in Go with TimescaleDB that ingests unstructured time-series metrics from upstream services (`cipher-route` and `cipher-exec`).
 
 ## Architecture
 - **Non-blocking Ingestion**: Accepts metrics over HTTP POST `/ingest`, parses and pushes into an internal buffered ring channel (`BUFFER_SIZE=10000`), returning `202 Accepted` in sub-millisecond times.

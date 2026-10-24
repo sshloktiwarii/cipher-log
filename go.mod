@@ -1,4 +1,4 @@
-module github.com/sshloktiwarii/foundry-pulse
+module github.com/sshloktiwarii/cipher-log
 
 go 1.24
 
