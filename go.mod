@@ -1,4 +1,4 @@
-module github.com/sshloktiwarii/local-telemetry-ingestion-engine
+module github.com/sshloktiwarii/foundry-pulse
 
 go 1.24
 

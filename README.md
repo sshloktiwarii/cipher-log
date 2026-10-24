@@ -1,6 +1,6 @@
-# Local Telemetry & Anomaly Ingestion Engine
+# Foundry Pulse: High-Throughput Telemetry & Anomaly Ingestion Engine
 
-A high-throughput observability API gateway built in Go with TimescaleDB that ingests unstructured time-series metrics from upstream services (MACR Router and Ephemeral Execution Sandbox).
+High-throughput observability API gateway built in Go with TimescaleDB that ingests unstructured time-series metrics from upstream services (`foundry-router` and `foundry-crucible`).
 
 ## Architecture
 - **Non-blocking Ingestion**: Accepts metrics over HTTP POST `/ingest`, parses and pushes into an internal buffered ring channel (`BUFFER_SIZE=10000`), returning `202 Accepted` in sub-millisecond times.
