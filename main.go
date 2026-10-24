@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -19,17 +20,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// TelemetryEvent matches the incoming metrics payload from MACR and Sandbox
 type TelemetryEvent struct {
-	Source    string                 `json:"source"`
-	EventType string                 `json:"event_type"`
-	Metrics   map[string]float64     `json:"metrics"`
-	Metadata  map[string]string      `json:"metadata,omitempty"`
-	Timestamp string                 `json:"timestamp,omitempty"`
+	Source     string             `json:"source"`
+	EventType  string             `json:"event_type"`
+	Metrics    map[string]float64 `json:"metrics"`
+	Metadata   map[string]string  `json:"metadata,omitempty"`
+	Timestamp  string             `json:"timestamp,omitempty"`
 	parsedTime time.Time
 }
 
-// Config holds runtime server parameters
 type Config struct {
 	Port         string
 	DatabaseURL  string
@@ -37,34 +36,33 @@ type Config struct {
 	BatchSize    int
 	FlushTimeout time.Duration
 	WorkerCount  int
+	AnomalyCheck time.Duration
 }
 
-// IngestionEngine coordinates concurrent stream ingestion and persistence
 type IngestionEngine struct {
-	cfg          Config
-	pool         *pgxpool.Pool
-	eventChan    chan TelemetryEvent
-	wg           sync.WaitGroup
-	ctx          context.Context
-	cancel       context.CancelFunc
-	totalIngested uint64
+	cfg            Config
+	pool           *pgxpool.Pool
+	eventChan      chan TelemetryEvent
+	wg             sync.WaitGroup
+	ctx            context.Context
+	cancel         context.CancelFunc
+	totalIngested  uint64
 	totalPersisted uint64
-	dbAvailable  bool
-	memBackup    []TelemetryEvent
-	memLock      sync.RWMutex
+	dbAvailable    bool
+	memBackup      []TelemetryEvent
+	memLock        sync.RWMutex
 }
 
 func NewIngestionEngine(cfg Config) *IngestionEngine {
 	ctx, cancel := context.WithCancel(context.Background())
 	engine := &IngestionEngine{
-		cfg:        cfg,
-		eventChan:  make(chan TelemetryEvent, cfg.BufferSize),
-		ctx:        ctx,
-		cancel:     cancel,
-		memBackup:  make([]TelemetryEvent, 0, 1000),
+		cfg:       cfg,
+		eventChan: make(chan TelemetryEvent, cfg.BufferSize),
+		ctx:       ctx,
+		cancel:    cancel,
+		memBackup: make([]TelemetryEvent, 0, 1000),
 	}
 
-	// Initialize TimescaleDB connection pool
 	if cfg.DatabaseURL != "" {
 		poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 		if err == nil {
@@ -87,11 +85,15 @@ func NewIngestionEngine(cfg Config) *IngestionEngine {
 		}
 	}
 
-	// Start worker pool
+	// Start worker pool for batch ingestion
 	for i := 0; i < cfg.WorkerCount; i++ {
 		engine.wg.Add(1)
 		go engine.worker(i)
 	}
+
+	// Start anomaly detection background monitor (every 60s)
+	engine.wg.Add(1)
+	go engine.anomalyMonitor()
 
 	return engine
 }
@@ -106,7 +108,6 @@ func (e *IngestionEngine) worker(id int) {
 	for {
 		select {
 		case <-e.ctx.Done():
-			// Drain remaining events in channel
 			for {
 				select {
 				case ev := <-e.eventChan:
@@ -168,7 +169,6 @@ func (e *IngestionEngine) flushBatch(batch []TelemetryEvent) {
 		}
 	}
 
-	// In-memory circular backup buffer if DB is offline or insertion fails
 	e.memLock.Lock()
 	if len(e.memBackup)+len(batch) > 10000 {
 		e.memBackup = e.memBackup[len(batch):]
@@ -178,23 +178,83 @@ func (e *IngestionEngine) flushBatch(batch []TelemetryEvent) {
 	atomic.AddUint64(&e.totalPersisted, uint64(len(batch)))
 }
 
+// anomalyMonitor checks TimescaleDB every 60s for error rate > 5% or latency spikes
+func (e *IngestionEngine) anomalyMonitor() {
+	defer e.wg.Done()
+	ticker := time.NewTicker(e.cfg.AnomalyCheck)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			e.checkAnomalies()
+		}
+	}
+}
+
+func (e *IngestionEngine) checkAnomalies() {
+	if e.pool == nil || !e.dbAvailable {
+		// Evaluate in-memory sliding window
+		e.memLock.RLock()
+		defer e.memLock.RUnlock()
+		if len(e.memBackup) == 0 {
+			return
+		}
+
+		errorsCount := 0
+		for _, ev := range e.memBackup {
+			if st, exists := ev.Metadata["status"]; exists && (st == "error" || st == "timeout" || strings.HasPrefix(st, "5")) {
+				errorsCount++
+			}
+		}
+
+		errorRate := (float64(errorsCount) / float64(len(e.memBackup))) * 100.0
+		if errorRate > 5.0 {
+			log.Printf("🚨 [ANOMALY ALERT] Error rate spike detected: %.2f%% (threshold: 5.0%%) across %d events",
+				errorRate, len(e.memBackup))
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Query last 5 minutes from TimescaleDB
+	query := `
+		SELECT 
+			count(*) AS total,
+			count(*) FILTER (WHERE metadata->>'status' IN ('error', 'timeout') OR (metrics->>'http_status')::int >= 500) AS errors,
+			coalesce(percentile_cont(0.99) WITHIN GROUP (ORDER BY (metrics->>'latency_ms')::numeric), 0) AS p99_latency
+		FROM telemetry_events 
+		WHERE time > NOW() - INTERVAL '5 minutes';
+	`
+
+	var total, errorsCount int64
+	var p99Latency float64
+
+	err := e.pool.QueryRow(ctx, query).Scan(&total, &errorsCount, &p99Latency)
+	if err == nil && total > 0 {
+		errorRate := (float64(errorsCount) / float64(total)) * 100.0
+		if errorRate > 5.0 {
+			log.Printf("🚨 [ANOMALY ALERT] High error rate: %.2f%% (%d/%d failed) in last 5m!", errorRate, errorsCount, total)
+		}
+		if p99Latency > 2000.0 {
+			log.Printf("🚨 [ANOMALY ALERT] Latency spike! P99 latency is %.2f ms (threshold: 2000ms)", p99Latency)
+		}
+	}
+}
+
 func (e *IngestionEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Healthcheck
 	if r.URL.Path == "/healthz" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"healthy","database_connected":%t,"ingested_count":%d,"persisted_count":%d}`,
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"healthy","database_connected":%t,"ingested_count":%d,"persisted_count":%d,"anomaly_monitor":true}`,
 			e.dbAvailable, atomic.LoadUint64(&e.totalIngested), atomic.LoadUint64(&e.totalPersisted))))
 		return
 	}
 
-	// Metrics Summary Query
-	if r.URL.Path == "/metrics/summary" && r.Method == http.MethodGet {
-		e.handleSummary(w, r)
-		return
-	}
-
-	// Core Ingest Endpoint
 	if r.URL.Path == "/ingest" {
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"Method not allowed, use POST"}`, http.StatusMethodNotAllowed)
@@ -210,7 +270,7 @@ func (e *IngestionEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (e *IngestionEngine) handleIngest(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, `{"error":"Failed to read request body"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"Failed to read body"}`, http.StatusBadRequest)
 		return
 	}
 	_ = r.Body.Close()
@@ -222,11 +282,10 @@ func (e *IngestionEngine) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if event.Source == "" || event.EventType == "" || event.Metrics == nil {
-		http.Error(w, `{"error":"Fields 'source', 'event_type', and 'metrics' are required"}`, http.StatusUnprocessableEntity)
+		http.Error(w, `{"error":"Missing required fields"}`, http.StatusUnprocessableEntity)
 		return
 	}
 
-	// Parse or assign event timestamp
 	if event.Timestamp != "" {
 		if t, err := time.Parse(time.RFC3339Nano, event.Timestamp); err == nil {
 			event.parsedTime = t
@@ -239,33 +298,15 @@ func (e *IngestionEngine) handleIngest(w http.ResponseWriter, r *http.Request) {
 		event.parsedTime = time.Now().UTC()
 	}
 
-	// Non-blocking submission to ingestion channel
 	select {
 	case e.eventChan <- event:
 		atomic.AddUint64(&e.totalIngested, 1)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"status":"accepted","message":"Metric queued for ingestion"}`))
+		_, _ = w.Write([]byte(`{"status":"accepted"}`))
 	default:
-		// Backpressure handling
-		http.Error(w, `{"error":"Ingestion queue saturated, retry with backoff"}`, http.StatusServiceUnavailable)
+		http.Error(w, `{"error":"Queue saturated"}`, http.StatusServiceUnavailable)
 	}
-}
-
-func (e *IngestionEngine) handleSummary(w http.ResponseWriter, r *http.Request) {
-	e.memLock.RLock()
-	defer e.memLock.RUnlock()
-
-	summary := map[string]interface{}{
-		"total_ingested":  atomic.LoadUint64(&e.totalIngested),
-		"total_persisted": atomic.LoadUint64(&e.totalPersisted),
-		"in_memory_cache": len(e.memBackup),
-		"recent_events":   e.memBackup,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(summary)
 }
 
 func (e *IngestionEngine) Close() {
@@ -298,6 +339,7 @@ func main() {
 		BatchSize:    batchSize,
 		FlushTimeout: time.Duration(flushMs) * time.Millisecond,
 		WorkerCount:  workers,
+		AnomalyCheck: 60 * time.Second,
 	}
 
 	engine := NewIngestionEngine(cfg)
@@ -307,27 +349,23 @@ func main() {
 		Handler:      engine,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
 	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[INIT] Local Telemetry Ingestion Engine running on port :%s", cfg.Port)
-		log.Printf("[INIT] Worker pool: %d workers | Batch: %d items | Flush: %v", cfg.WorkerCount, cfg.BatchSize, cfg.FlushTimeout)
+		log.Printf("[INIT] Local Telemetry & Anomaly Engine running on :%s", cfg.Port)
+		log.Printf("[INIT] Anomaly Detection: Continuous aggregate check active every 60s")
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("[FATAL] Telemetry Engine server failed: %v", err)
+			log.Fatalf("[FATAL] Server error: %v", err)
 		}
 	}()
 
 	<-stop
-	log.Println("[SHUTDOWN] Draining ingestion queue and shutting down...")
-
+	log.Println("[SHUTDOWN] Exiting Telemetry Engine...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	_ = server.Shutdown(ctx)
 	engine.Close()
-	log.Println("[SHUTDOWN] Telemetry Ingestion Engine exited cleanly.")
 }

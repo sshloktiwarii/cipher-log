@@ -1,0 +1,76 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "P99 & Average Request Latency (ms)",
+      "type": "timeseries",
+      "datasource": "TimescaleDB",
+      "targets": [
+        {
+          "rawSql": "SELECT time_bucket('1 minute', time) AS time, percentile_cont(0.99) WITHIN GROUP (ORDER BY (metrics->>'latency_ms')::numeric) AS p99_latency_ms, avg((metrics->>'latency_ms')::numeric) AS avg_latency_ms FROM telemetry_events WHERE time > $__timeFrom() AND metrics ? 'latency_ms' GROUP BY 1 ORDER BY 1;",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "title": "Token Throughput by Source",
+      "type": "timeseries",
+      "datasource": "TimescaleDB",
+      "targets": [
+        {
+          "rawSql": "SELECT time_bucket('1 minute', time) AS time, source, sum((metrics->>'token_count')::numeric) AS total_tokens FROM telemetry_events WHERE time > $__timeFrom() AND metrics ? 'token_count' GROUP BY 1, 2 ORDER BY 1;",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "title": "Sandbox Code Execution Duration (ms)",
+      "type": "timeseries",
+      "datasource": "TimescaleDB",
+      "targets": [
+        {
+          "rawSql": "SELECT time_bucket('1 minute', time) AS time, metadata->>'language' as language, avg((metrics->>'duration_ms')::numeric) AS avg_duration_ms FROM telemetry_events WHERE time > $__timeFrom() AND source = 'ephemeral-sandbox-polyglot' GROUP BY 1, 2 ORDER BY 1;",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "title": "Error Rate vs Success Rate",
+      "type": "timeseries",
+      "datasource": "TimescaleDB",
+      "targets": [
+        {
+          "rawSql": "SELECT time_bucket('1 minute', time) AS time, metadata->>'status' AS status, count(*) AS event_count FROM telemetry_events WHERE time > $__timeFrom() GROUP BY 1, 2 ORDER BY 1;",
+          "format": "time_series"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["ai-paas", "telemetry", "timescaledb"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["5s", "10s", "30s", "1m"] },
+  "timezone": "browser",
+  "title": "Local AI PaaS Telemetry & Routing Overview",
+  "uid": "ai-paas-overview",
+  "version": 1
+}
