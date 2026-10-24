@@ -171,7 +171,12 @@ func (e *IngestionEngine) flushBatch(batch []TelemetryEvent) {
 
 	e.memLock.Lock()
 	if len(e.memBackup)+len(batch) > 10000 {
-		e.memBackup = e.memBackup[len(batch):]
+		excess := (len(e.memBackup) + len(batch)) - 10000
+		if excess >= len(e.memBackup) {
+			e.memBackup = e.memBackup[:0]
+		} else {
+			e.memBackup = e.memBackup[excess:]
+		}
 	}
 	e.memBackup = append(e.memBackup, batch...)
 	e.memLock.Unlock()
@@ -247,6 +252,14 @@ func (e *IngestionEngine) checkAnomalies() {
 }
 
 func (e *IngestionEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	if r.URL.Path == "/healthz" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -268,6 +281,8 @@ func (e *IngestionEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *IngestionEngine) handleIngest(w http.ResponseWriter, r *http.Request) {
+	// Guard against unbounded body DoS
+	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, `{"error":"Failed to read body"}`, http.StatusBadRequest)
