@@ -1,4 +1,5 @@
 telemetry-engine
+foundry-pulse
 *.exe
 *.test
 .DS_Store
