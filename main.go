@@ -325,7 +325,7 @@ func (e *IngestionEngine) handleVerifyAuditChain(w http.ResponseWriter, r *http.
 		return
 	}
 
-	rows, err := e.sqliteDB.Query(`SELECT id, timestamp, source, event_type, metrics, metadata, prev_hash, merkle_hash FROM telemetry_events ORDER BY id ASC`)
+	rows, err := e.sqliteDB.Query(`SELECT id, CAST(timestamp AS TEXT), source, event_type, metrics, metadata, prev_hash, merkle_hash FROM telemetry_events WHERE merkle_hash IS NOT NULL AND merkle_hash != '' ORDER BY id ASC`)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"Query failed: %v"}`, err), http.StatusInternalServerError)
 		return
