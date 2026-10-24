@@ -1,6 +1,9 @@
+cipher-log
 telemetry-engine
 foundry-pulse
 *.exe
 *.test
+*.db
+*.db-*
 .DS_Store
 .env
